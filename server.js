@@ -1,241 +1,161 @@
-// JustListenly Core (Deepgram v3 compatible) — Twilio -> Deepgram -> OpenAI -> ElevenLabs -> Twilio
-import 'dotenv/config';
+// server.js
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
-import { OpenAI } from 'openai';
-import WebSocket from 'ws';
+import { Deepgram } from '@deepgram/sdk';
+import Twilio from 'twilio';
 
-// --- App & health ---
 const app = express();
-const PORT = process.env.PORT || 8080;
-const server = app.listen(PORT, () => {
-  console.log('Listening on', PORT);
-});
+const PORT = process.env.PORT || 3000;
 
+// --- Init clients
+const dg = new Deepgram(process.env.DEEPGRAM_API_KEY);
+const twilioClient = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const TWILIO_DOMAIN = process.env.TWILIO_DOMAIN; // e.g. https://justlistenly-core.twil.io
 
-// --- Crash guards ---
-process.on('unhandledRejection', (r) => console.error('UNHANDLED REJECTION:', r));
-process.on('uncaughtException', (e) => console.error('UNCAUGHT EXCEPTION:', e));
+// --- Simple health check
+app.get('/', (_req, res) => res.send('JustListenly stream is up'));
+const server = app.listen(PORT, () => console.log(`HTTP on :${PORT}`));
 
-// --- Env helpers ---
-function need(name) {
-  const v = process.env[name];
-  if (!v || !String(v).trim()) console.warn(`WARN: Missing env ${name}`);
-  return v;
-}
-const OPENAI_API_KEY = need('OPENAI_API_KEY');
-const DEEPGRAM_API_KEY = need('DEEPGRAM_API_KEY');
-const ELEVENLABS_API_KEY = need('ELEVENLABS_API_KEY');
-
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-const deepgram = createClient(DEEPGRAM_API_KEY);
-
-// Personas (Grampa spelling)
-const PERSONAS = {
-  grampa: { voiceId: process.env.ELEVEN_GRAMPA || '', opening: "I'm ready, kiddo. Tell me what you've got." },
-  grandma:{ voiceId: process.env.ELEVEN_GRANDMA || '', opening: "I’m right here with you." },
-  mom:    { voiceId: process.env.ELEVEN_MOM || '',     opening: "I’m here. Take your time." },
-  dad:    { voiceId: process.env.ELEVEN_DAD || '',     opening: "I’m listening. Go ahead." }
-};
-
-// Tuning
-const SILENCE_MS = 1800;      // reflect after ~1.8s of silence
-const WINDOW_MS  = 40000;     // look back ~40s
-const MAX_NUDGES_PER_MIN = 3; // guardrail
-
-const EMPATHY_PROMPT = `
-You are a nonjudgmental, empathetic listener.
-Return ONLY JSON: {"intent":"reflect|affirm|celebrate|clarify|silence","text":"...","wait_seconds": number}
-Rules:
-- ≤14 words. Echo content or feeling. Warm and gentle.
-- No advice, no should/could/would, no judgments, no contradictions.
-- Match emotional tone (sad/mad/anxious/proud). If unsure, neutral support.
-- If long pause and they seem stuck, you MAY ask one open question.
-- If self-harm/danger implied: intent="affirm" and text="I’m here with you. You’re not alone."
-`;
-
+// --- WebSocket for Twilio Media Streams
 const wss = new WebSocketServer({ server, path: '/stream' });
 
-wss.on('connection', async (twilioWS, req) => {
-  console.log('Twilio stream connected');
+// Crisis phrase regex (tune as needed)
+const CRISIS_RX = /\b(suicide|kill myself|end my life|don't want to live|cant'? go on|hurt myself|harm myself|want to die|end it all)\b/i;
 
-  const url = new URL(req.url, 'http://x');
-  const personaKey = url.searchParams.get('persona') || 'grampa';
-  const persona = PERSONAS[personaKey] || PERSONAS.grampa;
-
-  // State
-  let transcript = []; // [{t, text}]
-  let lastFinalAt = Date.now();
-  let nudges = [];     // timestamps
-  let silenceTimer = null;
-  let speakingBack = false;
-  let elevenWS = null;
-
-  // --- Deepgram v3 live connection ---
-  let dgConn;
+// Helper: send 988 + hangup NOW
+async function sendSafetyAndHangup(callSid) {
+  if (!callSid || !TWILIO_DOMAIN) return;
   try {
-    dgConn = deepgram.listen.live({
+    await twilioClient.calls(callSid).update({
+      twiml: `
+        <Response>
+          <Play>${TWILIO_DOMAIN}/assets/greeter_safety_988.mp3</Play>
+          <Hangup/>
+        </Response>
+      `
+    });
+    console.log(`[SAFETY] Played 988 & hung up for CallSid=${callSid}`);
+  } catch (err) {
+    console.error('[SAFETY] Twilio update failed:', err?.message || err);
+  }
+}
+
+wss.on('connection', (ws, req) => {
+  console.log('[WS] Twilio connected');
+
+  // We’ll stash per-call context here
+  let callSid = null;
+  let persona = 'grandpa';
+  let dgConn = null;
+  let safetyTriggered = false;
+
+  // Open Deepgram live transcription connection as soon as we get Twilio "start"
+  async function openDeepgram() {
+    if (dgConn) return;
+    dgConn = await dg.transcription.live({
       model: 'nova-2',
-      encoding: 'mulaw',
-      sample_rate: 8000,
       interim_results: true,
-      smart_format: true
-      // NOTE: VAD events changed in v3; we implement silence with a timer instead.
+      punctuate: true,
+      encoding: 'mulaw',      // Twilio sends PCMU
+      sample_rate: 8000,
+      diarize: false
     });
-  } catch (e) {
-    console.error('Deepgram connect failed:', e?.message || e);
-    try { twilioWS.close(); } catch {}
-    return;
-  }
 
-  // Open: send opener (if voice configured)
-  dgConn.on(LiveTranscriptionEvents.Open, () => {
-    if (persona.voiceId && ELEVENLABS_API_KEY) {
-      setTimeout(() => speakIntoCall(persona.opening, persona.voiceId), 250);
-    } else {
-      console.warn('No voice configured for persona:', personaKey);
-    }
-  });
+    dgConn.addListener('open', () => console.log('[DG] open'));
+    dgConn.addListener('error', (e) => console.error('[DG] error', e));
+    dgConn.addListener('close', () => console.log('[DG] close'));
 
-  // Each transcript packet (final or interim)
-  dgConn.on(LiveTranscriptionEvents.Transcript, (data) => {
-    try {
-      const alt = data?.channel?.alternatives?.[0];
-      if (!alt) return;
-      const text = alt.transcript || '';
-      if (!text) return;
-
-      // If the caller is speaking (we get audio), force barge-in: stop AI immediately
-      if (speakingBack && elevenWS && elevenWS.readyState === WebSocket.OPEN) {
-        try { elevenWS.close(); } catch {}
-        speakingBack = false;
-      }
-
-      // Only aggregate finals into our rolling window
-      if (data.is_final) {
-        transcript.push({ t: Date.now(), text });
-        const cutoff = Date.now() - WINDOW_MS;
-        transcript = transcript.filter(x => x.t >= cutoff);
-        lastFinalAt = Date.now();
-
-        // restart silence timer
-        if (silenceTimer) { clearTimeout(silenceTimer); }
-        silenceTimer = setTimeout(maybeReflect, SILENCE_MS);
-      }
-    } catch (e) {
-      console.error('Transcript handler error:', e?.message || e);
-    }
-  });
-
-  dgConn.on(LiveTranscriptionEvents.Close, () => {
-    // Deepgram closed; end call stream gracefully
-    try { if (elevenWS) elevenWS.close(); } catch {}
-    try { twilioWS.close(); } catch {}
-  });
-
-  dgConn.on(LiveTranscriptionEvents.Error, (e) => {
-    console.error('Deepgram error:', e);
-  });
-
-  // Forward audio from Twilio -> Deepgram
-  twilioWS.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (data.event === 'media' && data.media?.payload) {
-        const audio = Buffer.from(data.media.payload, 'base64');
-        dgConn.send(audio);
-      }
-    } catch (e) {
-      console.error('Parse/forward error:', e?.message || e);
-    }
-  });
-
-  twilioWS.on('close', () => {
-    console.log('Twilio stream closed');
-    try { dgConn.close(); } catch {}
-    try { if (elevenWS) elevenWS.close(); } catch {}
-    if (silenceTimer) clearTimeout(silenceTimer);
-  });
-
-  function canNudge() {
-    const now = Date.now();
-    nudges = nudges.filter(t => now - t < 60000);
-    const enoughSilence = (now - lastFinalAt) >= SILENCE_MS;
-    return enoughSilence && nudges.length < MAX_NUDGES_PER_MIN && !speakingBack;
-  }
-
-  async function maybeReflect() {
-    if (!canNudge()) return;
-    const windowText = transcript.map(x => x.text).join(' ').trim();
-    if (!windowText) return;
-    if (!openai) { console.warn('No OPENAI_API_KEY; skipping reflection'); return; }
-
-    let out;
-    try {
-      const resp = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: EMPATHY_PROMPT },
-          { role: 'user', content: `USER WINDOW (last ~40s): ${windowText}` }
-        ]
-      });
-      const content = resp?.choices?.[0]?.message?.content || '';
-      out = JSON.parse(content);
-    } catch (e) {
-      console.error('OpenAI or JSON parse error:', e?.message || e);
-      return;
-    }
-
-    if (!out || !out.text || out.intent === 'silence') return;
-    nudges.push(Date.now());
-    await speakIntoCall(out.text, persona.voiceId);
-  }
-
-  async function speakIntoCall(text, voiceId) {
-    if (!voiceId) { console.warn('speakIntoCall called without voiceId'); return; }
-    if (!ELEVENLABS_API_KEY) { console.warn('No ELEVENLABS_API_KEY set'); return; }
-    speakingBack = true;
-
-    const qs = new URLSearchParams({ model_id: 'eleven_monolingual_v1', format: 'ulaw_8000' });
-
-    let ws;
-    try {
-      ws = new WebSocket(
-        `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?${qs.toString()}`,
-        { headers: { 'xi-api-key': ELEVENLABS_API_KEY } }
-      );
-      elevenWS = ws;
-    } catch (e) {
-      console.error('ElevenLabs WS create error:', e?.message || e);
-      speakingBack = false;
-      return;
-    }
-
-    ws.on('open', () => {
+    // Receive transcripts from Deepgram
+    dgConn.addListener('transcriptReceived', async (msg) => {
+      if (safetyTriggered) return; // already handled
       try {
-        ws.send(JSON.stringify({
-          text,
-          voice_settings: { stability: 0.55, similarity_boost: 0.7, style: 0.2, use_speaker_boost: true }
-        }));
+        const data = JSON.parse(msg);
+        const alts = data?.channel?.alternatives?.[0];
+        const text = (alts?.transcript || '').trim();
+        const isFinal = data?.is_final;
+
+        if (!text) return;
+
+        // --- SAFETY CHECK (this is the bit you asked about) ---
+        if (CRISIS_RX.test(text)) {
+          console.log('[SAFETY] Crisis phrase detected:', text);
+          safetyTriggered = true;
+
+          // Tell Twilio to play 988 + hang up
+          await sendSafetyAndHangup(callSid);
+
+          // Close streams
+          try { dgConn?.finish(); } catch {}
+          try { ws?.close(); } catch {}
+          return;
+        }
+
+        // TODO: Your normal AI reply pipeline goes here when not in crisis:
+        // 1) Build a gentle listener response (text) from your model.
+        // 2) Call ElevenLabs TTS (via your /tts endpoint) to get audio/mpeg.
+        // 3) Stream TTS audio back to the caller (e.g., using <Stream> bidirectional bridge or Play URLs).
+        // For now, we’re focusing only on safety interrupt.
       } catch (e) {
-        console.error('ElevenLabs send error:', e?.message || e);
+        console.error('[DG] transcript parse error', e);
       }
     });
-
-    ws.on('message', (chunk) => {
-      try {
-        const payload = (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).toString('base64');
-        twilioWS.send(JSON.stringify({ event: 'media', media: { payload } }));
-      } catch (e) {
-        console.error('Forward to Twilio error:', e?.message || e);
-      }
-    });
-
-    const endSpeak = () => { speakingBack = false; };
-    ws.on('close', endSpeak);
-    ws.on('error', (e) => { console.error('ElevenLabs WS error:', e?.message || e); endSpeak(); });
   }
+
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      switch (msg.event) {
+        case 'start': {
+          // Option 1: Twilio sends CallSid here
+          callSid = msg?.start?.callSid || callSid;
+
+          // Option 2: We also sent it from Twilio Function as a <Parameter>
+          // Twilio Media Streams may include custom params separately; if you passed them,
+          // you can read them here as needed.
+
+          console.log('[WS] start', { callSid });
+
+          // If you passed persona from Twilio Function:
+          // e.g., in /start you did stream.parameter({name:'persona', value:'dad'})
+          // In Media Streams, the `start.customParameters` is not standard; easiest is you also
+          // pass persona in the WebSocket query string (?persona=dad) OR keep one persona per callSid in your own map.
+          // If you used query string: e.g., wss://.../stream?persona=dad
+          try {
+            const url = new URL(req.url, 'wss://placeholder');
+            const qPersona = url.searchParams.get('persona');
+            if (qPersona) persona = qPersona.toLowerCase();
+          } catch {}
+
+          await openDeepgram();
+          break;
+        }
+        case 'media': {
+          // Twilio sends base64 PCMU frames
+          const payload = msg.media?.payload;
+          if (dgConn && payload && !safetyTriggered) {
+            const buf = Buffer.from(payload, 'base64');
+            dgConn.send(buf);
+          }
+          break;
+        }
+        case 'stop': {
+          console.log('[WS] stop');
+          try { dgConn?.finish(); } catch {}
+          break;
+        }
+        default:
+          // other events: mark, etc.
+          break;
+      }
+    } catch (e) {
+      console.error('[WS] message parse error', e);
+    }
+  });
+
+  ws.on('close', () => {
+    try { dgConn?.finish(); } catch {}
+    console.log('[WS] closed');
+  });
 });
 
