@@ -8,9 +8,11 @@ import WebSocket from 'ws';
 
 // --- App & health ---
 const app = express();
-app.get('/health', (_req, res) => res.status(200).send('ok'));
-const server = app.listen(process.env.PORT || 8080, () =>
-  console.log('Listening on', server.address().port)
+const PORT = process.env.PORT || 8080;
+const server = app.listen(PORT, () => {
+  console.log('Listening on', PORT);
+});
+
 );
 
 // --- Crash guards ---
