@@ -13,7 +13,6 @@ const server = app.listen(PORT, () => {
   console.log('Listening on', PORT);
 });
 
-);
 
 // --- Crash guards ---
 process.on('unhandledRejection', (r) => console.error('UNHANDLED REJECTION:', r));
