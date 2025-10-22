@@ -1,28 +1,54 @@
-// server.js
+// server.js — JustListenly live stream backend (Railway)
+// Requirements (Railway → Variables):
+// PORT=3000
+// DEEPGRAM_API_KEY=dg_...
+// TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// TWILIO_DOMAIN=https://justlistenly-menu-9576.twil.io   // your Twilio Functions domain
+//
+// Optional (for your future TTS/reply flow):
+// ELEVENLABS_API_KEY=...
+// ELEVEN_VOICE_ID_GRAMPA=...
+// ELEVEN_VOICE_ID_GRANDMA=...
+// ELEVEN_VOICE_ID_MOM=...
+// ELEVEN_VOICE_ID_DAD=...
+
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { Deepgram } from '@deepgram/sdk';
+import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import Twilio from 'twilio';
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Init clients
-const dg = new Deepgram(process.env.DEEPGRAM_API_KEY);
-const twilioClient = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const TWILIO_DOMAIN = process.env.TWILIO_DOMAIN; // e.g. https://justlistenly-core.twil.io
+// ---- Safety phrase detection (tune as needed)
+const CRISIS_RX =
+  /\b(suicide|kill myself|end my life|don't want to live|cant'? ?go on|hurt myself|harm myself|want to die|end it all)\b/i;
 
-// --- Simple health check
+// ---- Clients
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+const twilioClient = Twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+const TWILIO_DOMAIN = process.env.TWILIO_DOMAIN; // e.g., https://justlistenly-menu-9576.twil.io
+if (!TWILIO_DOMAIN) {
+  console.warn(
+    '[WARN] TWILIO_DOMAIN not set. 988 playback will fail. Set it in Railway → Variables.'
+  );
+}
+
+// ---- Express app + health check
+const app = express();
 app.get('/', (_req, res) => res.send('JustListenly stream is up'));
-const server = app.listen(PORT, () => console.log(`HTTP on :${PORT}`));
+const server = app.listen(PORT, () =>
+  console.log(`[HTTP] Listening on :${PORT}`)
+);
 
-// --- WebSocket for Twilio Media Streams
+// ---- WebSocket: Twilio connects here from /start
 const wss = new WebSocketServer({ server, path: '/stream' });
 
-// Crisis phrase regex (tune as needed)
-const CRISIS_RX = /\b(suicide|kill myself|end my life|don't want to live|cant'? go on|hurt myself|harm myself|want to die|end it all)\b/i;
-
-// Helper: send 988 + hangup NOW
+// ---- Tell Twilio to play 988 and hang up immediately
 async function sendSafetyAndHangup(callSid) {
   if (!callSid || !TWILIO_DOMAIN) return;
   try {
@@ -32,9 +58,9 @@ async function sendSafetyAndHangup(callSid) {
           <Play>${TWILIO_DOMAIN}/assets/greeter_safety_988.mp3</Play>
           <Hangup/>
         </Response>
-      `
+      `,
     });
-    console.log(`[SAFETY] Played 988 & hung up for CallSid=${callSid}`);
+    console.log(`[SAFETY] Played 988 & hung up (CallSid=${callSid})`);
   } catch (err) {
     console.error('[SAFETY] Twilio update failed:', err?.message || err);
   }
@@ -43,119 +69,37 @@ async function sendSafetyAndHangup(callSid) {
 wss.on('connection', (ws, req) => {
   console.log('[WS] Twilio connected');
 
-  // We’ll stash per-call context here
+  // Per-call state
   let callSid = null;
-  let persona = 'grandpa';
+  let persona = 'grampa'; // default spelling per your system
   let dgConn = null;
   let safetyTriggered = false;
 
-  // Open Deepgram live transcription connection as soon as we get Twilio "start"
+  // Open Deepgram live transcription (v3 API)
   async function openDeepgram() {
     if (dgConn) return;
-    dgConn = await dg.transcription.live({
+
+    dgConn = await deepgram.listen.live({
       model: 'nova-2',
       interim_results: true,
       punctuate: true,
-      encoding: 'mulaw',      // Twilio sends PCMU
+      encoding: 'mulaw', // Twilio Media Streams sends PCMU
       sample_rate: 8000,
-      diarize: false
+      diarize: false,
     });
 
-    dgConn.addListener('open', () => console.log('[DG] open'));
-    dgConn.addListener('error', (e) => console.error('[DG] error', e));
-    dgConn.addListener('close', () => console.log('[DG] close'));
+    dgConn.on(LiveTranscriptionEvents.Open, () => console.log('[DG] open'));
+    dgConn.on(LiveTranscriptionEvents.Error, (e) =>
+      console.error('[DG] error', e)
+    );
+    dgConn.on(LiveTranscriptionEvents.Close, () => console.log('[DG] close'));
 
-    // Receive transcripts from Deepgram
-    dgConn.addListener('transcriptReceived', async (msg) => {
-      if (safetyTriggered) return; // already handled
-      try {
-        const data = JSON.parse(msg);
-        const alts = data?.channel?.alternatives?.[0];
-        const text = (alts?.transcript || '').trim();
-        const isFinal = data?.is_final;
+    // Incoming transcripts from Deepgram
+    dgConn.on(
+      LiveTranscriptionEvents.Transcript,
+      async (data /** JSON object */) => {
+        if (safetyTriggered) return;
 
-        if (!text) return;
-
-        // --- SAFETY CHECK (this is the bit you asked about) ---
-        if (CRISIS_RX.test(text)) {
-          console.log('[SAFETY] Crisis phrase detected:', text);
-          safetyTriggered = true;
-
-          // Tell Twilio to play 988 + hang up
-          await sendSafetyAndHangup(callSid);
-
-          // Close streams
-          try { dgConn?.finish(); } catch {}
-          try { ws?.close(); } catch {}
-          return;
-        }
-
-        // TODO: Your normal AI reply pipeline goes here when not in crisis:
-        // 1) Build a gentle listener response (text) from your model.
-        // 2) Call ElevenLabs TTS (via your /tts endpoint) to get audio/mpeg.
-        // 3) Stream TTS audio back to the caller (e.g., using <Stream> bidirectional bridge or Play URLs).
-        // For now, we’re focusing only on safety interrupt.
-      } catch (e) {
-        console.error('[DG] transcript parse error', e);
-      }
-    });
-  }
-
-  ws.on('message', async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      switch (msg.event) {
-        case 'start': {
-          // Option 1: Twilio sends CallSid here
-          callSid = msg?.start?.callSid || callSid;
-
-          // Option 2: We also sent it from Twilio Function as a <Parameter>
-          // Twilio Media Streams may include custom params separately; if you passed them,
-          // you can read them here as needed.
-
-          console.log('[WS] start', { callSid });
-
-          // If you passed persona from Twilio Function:
-          // e.g., in /start you did stream.parameter({name:'persona', value:'dad'})
-          // In Media Streams, the `start.customParameters` is not standard; easiest is you also
-          // pass persona in the WebSocket query string (?persona=dad) OR keep one persona per callSid in your own map.
-          // If you used query string: e.g., wss://.../stream?persona=dad
-          try {
-            const url = new URL(req.url, 'wss://placeholder');
-            const qPersona = url.searchParams.get('persona');
-            if (qPersona) persona = qPersona.toLowerCase();
-          } catch {}
-
-          await openDeepgram();
-          break;
-        }
-        case 'media': {
-          // Twilio sends base64 PCMU frames
-          const payload = msg.media?.payload;
-          if (dgConn && payload && !safetyTriggered) {
-            const buf = Buffer.from(payload, 'base64');
-            dgConn.send(buf);
-          }
-          break;
-        }
-        case 'stop': {
-          console.log('[WS] stop');
-          try { dgConn?.finish(); } catch {}
-          break;
-        }
-        default:
-          // other events: mark, etc.
-          break;
-      }
-    } catch (e) {
-      console.error('[WS] message parse error', e);
-    }
-  });
-
-  ws.on('close', () => {
-    try { dgConn?.finish(); } catch {}
-    console.log('[WS] closed');
-  });
-});
-
+        try {
+          const alt = data?.channel?.alternatives?.[0];
+          const text = (alt?.transcript || '').t
