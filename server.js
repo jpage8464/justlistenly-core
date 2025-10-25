@@ -1,26 +1,37 @@
 // server.js
-// JustListenly Layer 2: live transcription from Twilio stream
+// JustListenly core server with WebSocket media stream and fallback HTTP handler
+
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import { transcribeChunkToText } from "./transcription.js";
 
 const app = express();
-const server = http.createServer(app);
 
-// quick health check endpoint
+// Health check
 app.get("/", (req, res) => {
   res.send("JustListenly core is up");
 });
 
-// keep per-connection state
+// IMPORTANT: add HTTP handler for /twilio-stream so Railway won't 502 on probe
+app.get("/twilio-stream", (req, res) => {
+  console.log("🌐 HTTP GET /twilio-stream (likely a probe/preflight)");
+  res.status(200).send("twilio-stream endpoint is WebSocket only");
+});
+
+const server = http.createServer(app);
+
+// Per-call state
 const connectionState = new Map();
 
-// WebSocket Twilio connects to
-const wss = new WebSocketServer({ server, path: "/twilio-stream" });
+// WebSocket endpoint Twilio should connect to
+const wss = new WebSocketServer({
+  server,
+  path: "/twilio-stream"
+});
 
-wss.on("connection", (ws) => {
-  console.log("📞 New call connected to /twilio-stream");
+wss.on("connection", (ws, req) => {
+  console.log("📞 New call connected to /twilio-stream via WebSocket");
 
   connectionState.set(ws, {
     partial: "",
@@ -32,6 +43,7 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(data.toString());
     } catch {
+      console.error("❌ Bad JSON from Twilio");
       return;
     }
 
@@ -44,8 +56,9 @@ wss.on("connection", (ws) => {
     if (msg.event === "media") {
       const audioB64 = msg.media?.payload;
       if (audioB64) {
-        // send each chunk to transcription
+        // Send chunk to STT
         const text = await transcribeChunkToText(audioB64);
+
         if (text && text.trim() !== "") {
           state.partial += " " + text.trim();
           console.log("🎙 partial so far:", state.partial.trim());
@@ -55,6 +68,7 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       console.log("⏹ Stream stopped for callSid:", msg.stop?.callSid);
+
       if (state.partial.trim() !== "") {
         state.transcript.push(state.partial.trim());
         console.log("📝 final chunk:", state.partial.trim());
@@ -69,6 +83,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("❌ Call / stream disconnected");
+
     const state = connectionState.get(ws);
     if (state) {
       console.log("📄 full transcript of call:", state.transcript);
@@ -77,5 +92,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("🚀 Server listening on port", PORT));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log("🚀 Server listening on port", PORT);
+});
