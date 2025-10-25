@@ -1,16 +1,14 @@
 {
   "name": "justlistenly-core",
   "version": "1.0.0",
-  "description": "JustListenly core voice stream bridge for Twilio",
+  "description": "JustListenly core streaming server",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.0",
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": "18.x"
+    "ws": "^8.17.0"
   }
 }
