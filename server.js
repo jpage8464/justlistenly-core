@@ -5,7 +5,7 @@ import { WebSocketServer } from 'ws';
 
 const app = express();
 
-// Simple health check
+// Simple health check route
 app.get('/', (req, res) => {
   res.status(200).send('JustListenly core is awake and ready.');
 });
@@ -13,10 +13,10 @@ app.get('/', (req, res) => {
 // Create HTTP server
 const server = http.createServer(app);
 
-// Create a WebSocket server (not attached globally)
+// Create WebSocket server (noServer mode lets us manually accept upgrades)
 const wss = new WebSocketServer({ noServer: true });
 
-// Handle Twilio's WebSocket upgrade
+// Handle Twilio WebSocket upgrades
 server.on('upgrade', (req, socket, head) => {
   if (req.url && req.url.startsWith('/stream')) {
     console.log('[UPGRADE] Accepting WS upgrade for', req.url);
@@ -29,7 +29,7 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-// Handle new WS connection
+// Handle live WebSocket connections
 wss.on('connection', (ws, req) => {
   console.log('[WS] Twilio WebSocket CONNECTED');
 
@@ -38,23 +38,34 @@ wss.on('connection', (ws, req) => {
     try {
       data = JSON.parse(message.toString());
     } catch (err) {
-      console.error('[WS] Bad JSON:', err);
+      console.error('[WS] Invalid JSON received:', err);
       return;
     }
 
     switch (data.event) {
       case 'start':
         console.log('[WS] Stream started');
+        console.log('[WS] Persona:', data.start?.customParameters?.persona || 'unknown');
+        console.log('[WS] Stream SID:', data.start?.streamSid || 'none');
         break;
+
       case 'media':
-        // Avoid spamming logs with media frames
+        // Log only the first few characters of the first few frames
+        // (Twilio sends 50 frames per second — don’t log all)
+        if (!ws.loggedFirstFrame) {
+          console.log('[WS] First media frame received (base64 preview):', data.media.payload.slice(0, 30) + '...');
+          ws.loggedFirstFrame = true;
+        }
         break;
+
       case 'stop':
         console.log('[WS] Stream stopped');
+        console.log('[WS] Socket closing now...');
         ws.close();
         break;
+
       default:
-        console.log('[WS] Event:', data.event);
+        console.log('[WS] Unhandled event type:', data.event);
     }
   });
 
@@ -62,8 +73,8 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => console.error('[WS] Error:', err));
 });
 
-// Force Railway to use the correct port & keep-alive
+// Force Railway to use correct port
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`[SERVER] Listening securely on port ${PORT}`);
+  console.log(`[SERVER] Listening on port ${PORT}`);
 });
