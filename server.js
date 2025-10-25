@@ -5,19 +5,19 @@ import { WebSocketServer } from 'ws';
 
 const app = express();
 
-// Health check so hitting the root URL wakes the service
+// Simple health check
 app.get('/', (req, res) => {
-  res.status(200).send('JustListenly core is running');
+  res.status(200).send('JustListenly core is awake and ready.');
 });
 
+// Create HTTP server
 const server = http.createServer(app);
 
-// Create WS server but don't attach globally
+// Create a WebSocket server (not attached globally)
 const wss = new WebSocketServer({ noServer: true });
 
-// Handle WebSocket upgrades from Twilio
+// Handle Twilio's WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
-  // Accept /stream or /stream?...
   if (req.url && req.url.startsWith('/stream')) {
     console.log('[UPGRADE] Accepting WS upgrade for', req.url);
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -29,7 +29,7 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-// When Twilio successfully connects
+// Handle new WS connection
 wss.on('connection', (ws, req) => {
   console.log('[WS] Twilio WebSocket CONNECTED');
 
@@ -38,38 +38,32 @@ wss.on('connection', (ws, req) => {
     try {
       data = JSON.parse(message.toString());
     } catch (err) {
-      console.error('[WS] Could not parse incoming message as JSON', err);
+      console.error('[WS] Bad JSON:', err);
       return;
     }
 
-    if (data.event === 'start') {
-      console.log('[WS] Stream started');
-      console.log('[WS] Persona:', data.start?.customParameters?.persona);
-      console.log('[WS] Stream SID:', data.start?.streamSid);
-    }
-
-    if (data.event === 'media') {
-      // Caller audio frames
-      // We can add console.log here later, but logging every chunk can be VERY spammy.
-    }
-
-    if (data.event === 'stop') {
-      console.log('[WS] Stream stopped');
-      ws.close();
+    switch (data.event) {
+      case 'start':
+        console.log('[WS] Stream started');
+        break;
+      case 'media':
+        // Avoid spamming logs with media frames
+        break;
+      case 'stop':
+        console.log('[WS] Stream stopped');
+        ws.close();
+        break;
+      default:
+        console.log('[WS] Event:', data.event);
     }
   });
 
-  ws.on('close', () => {
-    console.log('[WS] Socket closed');
-  });
-
-  ws.on('error', (err) => {
-    console.error('[WS] Socket error', err);
-  });
+  ws.on('close', () => console.log('[WS] Socket closed'));
+  ws.on('error', (err) => console.error('[WS] Error:', err));
 });
 
-const PORT = process.env.PORT || 3000;
+// Force Railway to use the correct port & keep-alive
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`[SERVER] Listening on port ${PORT}`);
+  console.log(`[SERVER] Listening securely on port ${PORT}`);
 });
-
