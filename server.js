@@ -1,76 +1,81 @@
 // server.js
-// Layer 1 of JustListenly:
-// - Twilio calls us over WebSocket
-// - We log live audio chunks so we know the stream is working
-
+// JustListenly Layer 2: live transcription from Twilio stream
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
+import { transcribeChunkToText } from "./transcription.js";
 
 const app = express();
 const server = http.createServer(app);
 
-// health check route (lets you hit the URL in a browser)
+// quick health check endpoint
 app.get("/", (req, res) => {
   res.send("JustListenly core is up");
 });
 
-// WebSocket endpoint Twilio will connect to
-const wss = new WebSocketServer({
-  server,
-  path: "/twilio-stream"
-});
+// keep per-connection state
+const connectionState = new Map();
 
-wss.on("connection", (ws, req) => {
+// WebSocket Twilio connects to
+const wss = new WebSocketServer({ server, path: "/twilio-stream" });
+
+wss.on("connection", (ws) => {
   console.log("📞 New call connected to /twilio-stream");
 
-  ws.on("message", (data) => {
+  connectionState.set(ws, {
+    partial: "",
+    transcript: []
+  });
+
+  ws.on("message", async (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
-    } catch (err) {
-      console.error("❌ Could not parse incoming WS message", err);
+    } catch {
       return;
     }
 
-    // Twilio Media Stream messages have `event` types.
-    // Common ones are: "start", "media", "dtmf", "stop"
+    const state = connectionState.get(ws);
 
     if (msg.event === "start") {
-      // when the stream starts
-      const callSid = msg.start?.callSid;
-      console.log("▶️ Stream started for callSid:", callSid);
+      console.log("▶️ Stream started for callSid:", msg.start?.callSid);
     }
 
     if (msg.event === "media") {
-      // this is BASE64 encoded audio from the caller's mic
       const audioB64 = msg.media?.payload;
       if (audioB64) {
-        // for Layer 1 we just prove we are receiving live audio chunks
-        console.log("🎙 audio chunk length (base64):", audioB64.length);
+        // send each chunk to transcription
+        const text = await transcribeChunkToText(audioB64);
+        if (text && text.trim() !== "") {
+          state.partial += " " + text.trim();
+          console.log("🎙 partial so far:", state.partial.trim());
+        }
+      }
+    }
+
+    if (msg.event === "stop") {
+      console.log("⏹ Stream stopped for callSid:", msg.stop?.callSid);
+      if (state.partial.trim() !== "") {
+        state.transcript.push(state.partial.trim());
+        console.log("📝 final chunk:", state.partial.trim());
+        state.partial = "";
       }
     }
 
     if (msg.event === "dtmf") {
-      // caller pressed a key (like 1,2,3,4)
-      const digit = msg.dtmf?.digits;
-      console.log("☎️ Caller pressed:", digit);
-    }
-
-    if (msg.event === "stop") {
-      // Twilio tells us the stream is ending
-      const callSid = msg.stop?.callSid;
-      console.log("⏹ Stream stopped for callSid:", callSid);
+      console.log("☎️ Caller pressed:", msg.dtmf?.digits);
     }
   });
 
   ws.on("close", () => {
     console.log("❌ Call / stream disconnected");
+    const state = connectionState.get(ws);
+    if (state) {
+      console.log("📄 full transcript of call:", state.transcript);
+      connectionState.delete(ws);
+    }
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("🚀 Server listening on port", PORT);
-});
-
+server.listen(PORT, () => console.log("🚀 Server listening on port", PORT));
