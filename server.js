@@ -5,19 +5,20 @@ import { WebSocketServer } from "ws";
 
 const app = express();
 
-// Health check so you can ping the root in a browser
+// Basic health check endpoint so you can wake the service in browser
 app.get("/", (req, res) => {
   res.status(200).send("✅ JustListenly core running");
 });
 
-// Create a raw HTTP server that Express sits on
+// Create the raw HTTP server that powers Express
 const server = http.createServer(app);
 
-// Create a WebSocket server, but don't bind it to a path yet.
-// We'll manually upgrade only /stream.
+// Create a WebSocketServer in "noServer" mode.
+// We'll manually accept upgrades only on /stream.
 const wss = new WebSocketServer({ noServer: true });
 
-// Handle WebSocket upgrade requests (Twilio will hit /stream with Upgrade: websocket)
+// Twilio will request wss://.../stream with Upgrade: websocket
+// This MUST respond with a 101 Switching Protocols or Twilio will hang up.
 server.on("upgrade", (req, socket, head) => {
   if (req.url && req.url.startsWith("/stream")) {
     console.log("[UPGRADE] Incoming upgrade for", req.url);
@@ -30,7 +31,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// When Twilio has successfully upgraded to WebSocket
+// Once Twilio is upgraded to WS, we'll start getting "start", "media", "stop" events
 wss.on("connection", (ws, req) => {
   console.log("[WS] Twilio WebSocket CONNECTED");
 
@@ -43,7 +44,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // Twilio sends JSON events: start, media, stop
     if (data.event === "start") {
       console.log("[WS] Stream started");
       console.log("[WS] Persona:", data.start?.customParameters?.persona || "(none)");
@@ -51,8 +51,7 @@ wss.on("connection", (ws, req) => {
     }
 
     if (data.event === "media") {
-      // This is caller audio. It's base64 PCM16 8kHz mono.
-      // We won't log every frame (too spammy), but we can log the first frame.
+      // base64-encoded PCM16 mono 8kHz chunks from caller
       if (!ws._loggedFirstFrame) {
         console.log(
           "[WS] First media frame (base64 preview):",
@@ -77,7 +76,7 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// Start listening on the port Railway assigned
+// Listen on Railway's assigned port
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`[SERVER] Listening on port ${PORT}`);
