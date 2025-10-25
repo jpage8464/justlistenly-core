@@ -1,6 +1,6 @@
 // server.js
-import http from 'http';
 import express from 'express';
+import http from 'http';
 import { WebSocketServer } from 'ws';
 
 const app = express();
@@ -10,60 +10,56 @@ app.get('/', (req, res) => {
 });
 
 const server = http.createServer(app);
-
 const wss = new WebSocketServer({ noServer: true });
 
+// Handle WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/stream') {
-    console.log('[UPGRADE] Incoming upgrade for /stream');
+  console.log('[UPGRADE] Request for', req.url);
+
+  // Accept Twilio’s /stream and /stream?query=... paths
+  if (req.url && req.url.startsWith('/stream')) {
+    console.log('[UPGRADE] Accepting WebSocket upgrade...');
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
   } else {
-    console.log('[UPGRADE] Rejected upgrade for path:', req.url);
+    console.log('[UPGRADE] Rejected upgrade for', req.url);
     socket.destroy();
   }
 });
 
+// When Twilio connects
 wss.on('connection', (ws, req) => {
   console.log('[WS] Twilio connected to /stream');
 
-  ws.on('message', (msg) => {
-    let data;
+  ws.on('message', (message) => {
     try {
-      data = JSON.parse(msg.toString());
+      const data = JSON.parse(message.toString());
+
+      if (data.event === 'start') {
+        console.log('[WS] Stream started');
+        console.log('Stream SID:', data.start?.streamSid);
+        console.log('Persona:', data.start?.customParameters?.persona);
+      }
+
+      if (data.event === 'media') {
+        // Incoming audio chunks
+      }
+
+      if (data.event === 'stop') {
+        console.log('[WS] Stream stopped by Twilio');
+        ws.close();
+      }
     } catch (err) {
-      console.error('[WS] Failed to parse message as JSON', err);
-      return;
-    }
-
-    if (data.event === 'start') {
-      console.log('[WS] Stream started');
-      console.log('[WS] Stream SID:', data.start?.streamSid);
-      console.log('[WS] Persona:', data.start?.customParameters?.persona);
-    }
-
-    if (data.event === 'media') {
-      // audio chunks
-    }
-
-    if (data.event === 'stop') {
-      console.log('[WS] Stream stopped by Twilio');
-      ws.close();
+      console.error('[WS] Message error:', err);
     }
   });
 
-  ws.on('close', () => {
-    console.log('[WS] WebSocket closed');
-  });
-
-  ws.on('error', (err) => {
-    console.error('[WS] WebSocket error', err);
-  });
+  ws.on('close', () => console.log('[WS] Closed'));
+  ws.on('error', (err) => console.error('[WS] Error', err));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`[SERVER] Listening on port ${PORT}`);
 });
-
