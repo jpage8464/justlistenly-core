@@ -1,85 +1,76 @@
 // server.js
+// Layer 1 of JustListenly:
+// - Twilio calls us over WebSocket
+// - We log live audio chunks so we know the stream is working
+
 import express from "express";
 import http from "http";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
-
-// Health check so you can hit the root in a browser and wake Railway
-app.get("/", (req, res) => {
-  res.status(200).send("✅ JustListenly core running");
-});
-
-// Create raw HTTP server that Express sits on
 const server = http.createServer(app);
 
-// Make a WebSocketServer in "noServer" mode.
-// We will ONLY attach it for /stream upgrades.
-const wss = new WebSocketServer({ noServer: true });
-
-// This is the critical part for Twilio streaming.
-// Twilio calls wss://<your-domain>/stream and expects a WS upgrade.
-// We MUST answer with 101 Switching Protocols here.
-server.on("upgrade", (req, socket, head) => {
-  if (req.url && req.url.startsWith("/stream")) {
-    console.log("[UPGRADE] Incoming upgrade for", req.url);
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-  } else {
-    console.log("[UPGRADE] Rejected upgrade for path:", req.url);
-    socket.destroy();
-  }
+// health check route (lets you hit the URL in a browser)
+app.get("/", (req, res) => {
+  res.send("JustListenly core is up");
 });
 
-// Handle an accepted WebSocket connection from Twilio
-wss.on("connection", (ws, req) => {
-  console.log("[WS] Twilio WebSocket CONNECTED");
+// WebSocket endpoint Twilio will connect to
+const wss = new WebSocketServer({
+  server,
+  path: "/twilio-stream"
+});
 
-  ws.on("message", (raw) => {
-    let data;
+wss.on("connection", (ws, req) => {
+  console.log("📞 New call connected to /twilio-stream");
+
+  ws.on("message", (data) => {
+    let msg;
     try {
-      data = JSON.parse(raw.toString());
+      msg = JSON.parse(data.toString());
     } catch (err) {
-      console.error("[WS] Failed to parse incoming message as JSON:", err);
+      console.error("❌ Could not parse incoming WS message", err);
       return;
     }
 
-    // Twilio sends three event types: start, media, stop
-    if (data.event === "start") {
-      console.log("[WS] Stream started");
-      console.log("[WS] Persona:", data.start?.customParameters?.persona || "(none)");
-      console.log("[WS] Stream SID:", data.start?.streamSid || "(no sid)");
+    // Twilio Media Stream messages have `event` types.
+    // Common ones are: "start", "media", "dtmf", "stop"
+
+    if (msg.event === "start") {
+      // when the stream starts
+      const callSid = msg.start?.callSid;
+      console.log("▶️ Stream started for callSid:", callSid);
     }
 
-    if (data.event === "media") {
-      // Caller audio chunk, base64 PCM16 mono 8kHz
-      if (!ws._loggedFirstFrame) {
-        console.log(
-          "[WS] First media frame (base64 preview):",
-          data.media?.payload?.slice(0, 30) + "..."
-        );
-        ws._loggedFirstFrame = true;
+    if (msg.event === "media") {
+      // this is BASE64 encoded audio from the caller's mic
+      const audioB64 = msg.media?.payload;
+      if (audioB64) {
+        // for Layer 1 we just prove we are receiving live audio chunks
+        console.log("🎙 audio chunk length (base64):", audioB64.length);
       }
     }
 
-    if (data.event === "stop") {
-      console.log("[WS] Stream stopped");
-      ws.close();
+    if (msg.event === "dtmf") {
+      // caller pressed a key (like 1,2,3,4)
+      const digit = msg.dtmf?.digits;
+      console.log("☎️ Caller pressed:", digit);
+    }
+
+    if (msg.event === "stop") {
+      // Twilio tells us the stream is ending
+      const callSid = msg.stop?.callSid;
+      console.log("⏹ Stream stopped for callSid:", callSid);
     }
   });
 
   ws.on("close", () => {
-    console.log("[WS] Socket closed");
-  });
-
-  ws.on("error", (err) => {
-    console.error("[WS] Socket error:", err);
+    console.log("❌ Call / stream disconnected");
   });
 });
 
-// Start the server on the port Railway gives us
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`[SERVER] Listening on port ${PORT}`);
+  console.log("🚀 Server listening on port", PORT);
 });
+
